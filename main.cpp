@@ -31,6 +31,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <vector>
+#include <limits>
 
 //#define POLL_TIMEOUT 20000  // таймаут для poll, миллисекунды. Ставим 10 сек
 void parse_query( int fd_in, int64_t& num_val, int64_t& sum_val, int& res );
@@ -171,9 +172,21 @@ int server()
                 send( client_socket_fd, client_res_out.data(), client_res_out.length(), MSG_NOSIGNAL ); // выводим среднее в сокет клиенту
 
                 mlock( serv_res, sizeof(struct results) );  // блокируем общую память
-                serv_res->num_val += client_num;            // добавляем результаты текущего клиента
-                serv_res->sum_val += client_sum;
-                munlock( serv_res, sizeof(struct results) );    // разблокируем
+                if( (serv_res->sum_val>0 && client_sum > (std::numeric_limits<int64_t>::max()-serv_res->sum_val)) ||  // сумма sum_val и cur_int превысит max<int64_t>
+                        (serv_res->sum_val<0 && client_sum > (std::numeric_limits<int64_t>::min()-serv_res->sum_val)) )   // сумма sum_val и cur_int пренизит min<int64_t>
+                {
+                    munlock( serv_res, sizeof(struct results) );    // разблокируем
+                    client_res_out = "\n[Server] Overflow. Input from client ignored\n";
+                    fprintf( log_file, "%s", client_res_out.data() );
+                    send( client_socket_fd, client_res_out.data(), client_res_out.size(), MSG_NOSIGNAL ); // выводим сообщение в сокет клиенту
+                    fflush( log_file );
+                }
+                else
+                {
+                    serv_res->sum_val += client_sum;
+                    serv_res->num_val += client_num;            // добавляем результаты текущего клиента
+                    munlock( serv_res, sizeof(struct results) );    // разблокируем
+                }
 
                 time(&now);
                 tm_ptr = localtime(&now);

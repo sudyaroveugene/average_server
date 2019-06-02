@@ -70,7 +70,19 @@ void parse_query( int fd_in, int64_t& num_val, int64_t& sum_val, int& res )
                 }
             if( !isZero )  // лексема состоит не только из нулей
             {
-                cur_int = atoi( lexem.data() );
+//                fprintf( log_file, "\n[Parse query] lexem=%s\n", lexem.data() );
+//                fflush( log_file );
+                try{
+                    cur_int = std::stoll( lexem.data() );
+                }
+                catch ( std::invalid_argument& e ){
+                    cur_int = 0;
+                    fprintf( log_file, "\n[Parse query] Exception %s, value redused to zero\n", e.what() );
+                }
+                catch ( std::out_of_range& e ){
+                    cur_int = 0;
+                    fprintf( log_file, "\n[Parse query] Exception %s value redused to zero\n", e.what() );
+                }
                 fprintf( log_file, "%lld ", cur_int );
                 if( cur_int == 0 ) continue;    // лексема не из нулей, поэтому если сейчас cur_int==0, то лексема - не число
                 {
