@@ -2,77 +2,107 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdexcept>
+#include <limits>
 #if defined(__linux__)
 #include <sys/socket.h>
+#include <sys/poll.h>
 #endif
 #define STR_MAX_LEN 2048        // максимальная длина строки ввода
+#define POLL_TIMEOUT 30000  // таймаут для poll, миллисекунды. Ставим 10 сек
 
 size_t ReadLine(int fd, char* line, ssize_t len, int flush=0);
 
 extern FILE* log_file;
 
 // возвращает 2, если на входе пришел 0; 1 если произошла ошибка; 0 - все в порядке
-int parse_query( int fd_in, int64_t& num_val, int64_t& sum_val )
+void parse_query( int fd_in, int64_t& num_val, int64_t& sum_val, int& res )
 {
     char str[STR_MAX_LEN+1];
     std::string query, lexem;      // строка запроса и текущая лексема разбора
+    std::string tail;   // остаток строки от ближайшего к концу пробела
     size_t data_length = 0;
     int64_t cur_int;
-    int res = 0;
     bool newstring = true;
+    struct pollfd child_poll;
 
-    while( (data_length=ReadLine( fd_in, str, STR_MAX_LEN)) )
+    child_poll.events = POLLIN;
+    child_poll.fd = fd_in;
+    fprintf( log_file, "[Parse query] Start\n", num_val, sum_val );
+    fflush( log_file );
+    while( poll(&child_poll, 1, POLL_TIMEOUT)>0 )
     {
-        if( newstring ) // если предыдущая строка заканчивается переводом строки (буфер ввода разделил число на 2 части)
-            query = str; // то создаем новую строку
+        data_length=ReadLine( fd_in, str, STR_MAX_LEN);
+        if( data_length == 0 )
+            break;  // типа таймаут
+        if( newstring ) // если предыдущая строка заканчивается переводом строки
+            query = str;
         else
-            query.append( str ); // иначе добавляем в предыдущую
-        newstring = str[data_length-1] == '\n'; // прочитанная строка кончается переводом строки? true
-        if( !newstring || (query.compare("\n") )==0 || (query.compare("\r\n") )==0 )    // строка только из '\n' или незаконченная
-//                cout<<"empty string in begin"<<endl;
-            continue;   // пустая или незаконченная строка - пропускаем ее
-        fprintf( log_file, "[Parse query] New string received:\n%s", str );
-        fprintf( log_file, "[Parse query] Received integers:\n" );
+            query += str;
+        newstring = isspace(str[data_length-1]); //str[data_length-1] == '\n'; // прочитанная строка кончается переводом строки? true
+        if( !newstring )
+            continue;
+//        fprintf( log_file, "[Parse query] Query=\"%s\"", query.data() );
+        if( query.compare("\n")==0 || (query.compare("\r\n")==0 ) )   // строка только из '\n'
+//                std::cout<<"empty string 3"<<std::endl;
+            continue;   // пустая строка - пропускаем ее
+//        fprintf( log_file, "\n[Parse query] New string received:\n%s", query.data() );
+        fflush( log_file );
+        fprintf( log_file, "\n[Parse query] Received integers:\n" );
 //  разбираем полученную строку
         auto cur_ch=query.begin();
         do {
             while( isspace(*cur_ch) && cur_ch!=query.end() )    // пропускаем пробелы
                 cur_ch++ ;
+            if( cur_ch == query.end() ) break;
             lexem.clear();
             while( cur_ch!=query.end() && !isspace(*cur_ch) )
                     lexem += *cur_ch++;         // копируем символы в лексему
-            bool isNull = true; // вся лексема из нулей?
+            if( cur_ch == query.end() ) break;
+            bool isZero = true; // вся лексема из нулей?
             auto i=lexem.begin();
             if( *i == '-' || *i =='+' ) ++i;    // пропускаем лидирующий +/-
             for( ; i!=lexem.end(); ++i )
                 if( *i != '0' )
                 {
-                    isNull = false;
+                    isZero = false;
                     break;
                 }
-            if( !isNull )  // лексема состоит не только из нулей
+            if( !isZero )  // лексема состоит не только из нулей
             {
                 cur_int = atoi( lexem.data() );
-                if( cur_int == 0 ) continue;    // лексема не из нулей, поэтому если сейчас cur_int==0, то лексема - не число
                 fprintf( log_file, "%lld ", cur_int );
-                try
+                if( cur_int == 0 ) continue;    // лексема не из нулей, поэтому если сейчас cur_int==0, то лексема - не число
                 {
+                    if( (sum_val>0 && cur_int > (std::numeric_limits<int64_t>::max()-sum_val)) ||  // сумма sum_val и cur_int превысит max<int64_t>
+                            (sum_val<0 && cur_int > (std::numeric_limits<int64_t>::min()-sum_val)) )   // сумма sum_val и cur_int пренизит min<int64_t>
+                    {
+                        lexem = "\n[Parse query] Overflow. Input canceled num_values="+ std::to_string(num_val)+
+                                " sum="+std::to_string( sum_val )+"\n";
+                        fprintf( log_file, "%s", lexem.data() );
+                        send( fd_in, lexem.data(), lexem.size(), MSG_NOSIGNAL ); // выводим сообщение в сокет клиенту
+                        fflush( log_file );
+                        res = 0;
+                        return;
+                    }
                     sum_val += cur_int;
                     ++num_val;
                 }
-                catch( const std::overflow_error& e )
-                {
-                    lexem = "\n[Parse query] Overflow. Input canceled\n";
-                    fprintf( log_file, "%s", lexem.data() );
-                    send( fd_in, lexem.data(), lexem.size(), MSG_NOSIGNAL ); // выводим сообщение в сокет клиенту
-                    return 2;
-                }
             }
             else    // получили 0 - сигнал к завершению
-                return 2;
+            {
+                fprintf( log_file, "\n[Parse query] Exit by zero received: num_values=%lld, sum=%lld\n", num_val, sum_val );
+                fflush( log_file );
+                res= 0;
+                return;
+            }
         } while( cur_ch != query.end() );
+        fprintf( log_file, "\n" );
     }
-    return 0;
+    fprintf( log_file, "[Parse query] Exit by timeout: num_values=%lld, sum=%lld\n", num_val, sum_val );
+    fflush( log_file );
+    res = 2;
+    return;
 }
 
 // вспомогательная функция поиска символа в буфере ограниченной длины

@@ -23,6 +23,7 @@
 #include <sys/poll.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #endif
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,8 +32,8 @@
 #include <sys/types.h>
 #include <vector>
 
-#define POLL_TIMEOUT 10000  // таймаут для poll, миллисекунды. Ставим 10 сек
-int parse_query( int fd_in, int64_t& num_val, int64_t& sum_val );
+//#define POLL_TIMEOUT 20000  // таймаут для poll, миллисекунды. Ставим 10 сек
+void parse_query( int fd_in, int64_t& num_val, int64_t& sum_val, int& res );
 
 int set_nonblock( int fd )
 {
@@ -61,22 +62,14 @@ struct child_data
     pid_t pid;
     int fd;
     int dummy;  // неиспользуемая переменная для выравнивания в памяти
-    int64_t sum_val;    // сумма полученных чисел данного коннекта
-    int64_t num_val;    // количество полученных чисел данного коннекта
 };
 
-int request( child_data& client )
+struct results
 {
-    int res;
-
-//    do {
-        res = parse_query( client.fd, client.num_val, client.sum_val );    // получаем запрос
-        if( res>1  )    // 1 - ошибка, 2 - на входе нет запросов, 3 - выключить сервер
-            return res;  // ошибку игнорируем, остальное - выходим
-        fflush( log_file );
-//    } while( 1 );
-    return 0;
-}
+    int64_t sum_val;    // сумма полученных чисел данного коннекта
+    int64_t num_val;    // количество полученных чисел данного коннекта
+} *serv_res;	// указатель для общей памяти
+int shm_d;	// дескриптор общей памяти
 
 //--функция ожидания завершения дочернего процесса
 void sig_child(int sig)
@@ -99,18 +92,18 @@ int server()
     int res;
     char host[INET_ADDRSTRLEN];     // должно помещаться "ddd.ddd.ddd.ddd"
     const char* char_res;
-    std::vector<child_data> childs;   // массив pid для дочерних процессов
     pid_t pid;
     time_t now;
     struct tm *tm_ptr;
     char timebuf[80];
     struct sockaddr_in master; //--структура sockaddr_in для нашего сервера
-    struct pollfd child_poll;
+//    struct pollfd child_poll; // poll переехал в парсер
+    std::vector<child_data> childs;   // массив pid для дочерних процессов
 
     fprintf( log_file, "\n[Server] Start\n" );
     int master_socket = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP );
 
-    child_poll.events = POLLIN;
+//    child_poll.events = POLLIN;
     master.sin_family = AF_INET;    //--говорим что сокет принадлежит к семейству интернет
     master.sin_port = htons( atoi(port.data()) );      //--и прослушивает порт
     master.sin_addr.s_addr = htonl( INADDR_ANY );   //--наш серверный сокет принимает запросы от любых машин с любым IP-адресом
@@ -128,24 +121,18 @@ int server()
     fflush( log_file );
     while( 1 )
     {
-    //        if( !req.kepp_alive )     // была идея отслеживать keep-alive таймаут или 30 сек по умолчанию
 // устанавливаем обработчик завершения клиента (уже поработал и отключился, ждем завершение его дочернего процесса)
         signal( SIGCHLD, sig_child );
         client_socket_fd = accept( master_socket, (struct sockaddr*) (&client_name), &client_name_size ); //--подключение нашего клиента
         if( client_socket_fd>0 ) //--если подключение прошло успешно
         {
 //--то мы создаем копию нашего сервера для работы с другим клиентом(то есть один сеанс уже занят дублируем свободный процесс)
-            child_data new_child;
-            new_child.pid = pid;
-            new_child.fd = client_socket_fd;
-            childs.push_back( new_child ); // добавляем дочерний процесс в список
-
             pid=fork();
             if( pid==0 )
             {   // child
-                fprintf( log_file, "[Server] Client %d connected\n", getpid() );
-//                set_nonblock( client_socket_fd );
-                child_poll.fd = client_socket_fd;
+                fprintf( log_file, "\n[Server] Client %d connected\n", getpid() );
+                set_nonblock( client_socket_fd );
+//                child_poll.fd = client_socket_fd;
 
                 char_res =  inet_ntop( AF_INET, &client_name.sin_addr, host, sizeof(host) ); // --в переменную host заносим IP-клиента
                 fprintf( log_file, "[Server] Client %s connected on socket %d\n", host, client_socket_fd );
@@ -164,24 +151,29 @@ int server()
                 fprintf( log_file, "[Server] Waiting request\n" );
                 fflush( log_file );
 
-                if( poll(&child_poll, 1, POLL_TIMEOUT)>0 )
-                    res = request( new_child );
+                int64_t client_num =0, client_sum = 0;
+//                if( poll(&child_poll, 1, POLL_TIMEOUT)>0 )
+                std::string client_res_out = "\nReady to input:\r\n";
+                send( client_socket_fd, client_res_out.data(), client_res_out.size(), MSG_NOSIGNAL ); // выводим в сокет клиенту
 
-                int64_t num_val = 0, client_res = 0;
-                std::string client_res_out = "Average for ";
-                for( auto i=childs.begin(); i!=childs.end(); ++i )  // находим завершившийся клиент в векторе клиентов
-                    if( i->fd == client_socket_fd )//&& i->num_val>0 )
-//                    {
-                        if( i->fd == new_child.fd )
-                            fprintf( log_file, "[Server] i == new_child\n" );    // отладка
-//                        num_val = i->num_val;
-//                        client_res = i->sum_val/num_val;    // получаем среднее
-//                        childs.erase(i);                    // удаляем этот клиент из вектора
-//                        break;
-//                    }
-//                client_res_out += std::to_string(num_val) + " values = " + std::to_string(client_res)+"\r\n" +
-//                        "Connection closed\r\n";
-//                send( client_socket_fd, client_res_out.data(), client_res_out.length(), MSG_NOSIGNAL ); // выводим среднее в сокет клиенту
+                parse_query( client_socket_fd, client_num, client_sum, res );
+//                fprintf( log_file, "[Server] Request res=%d\n", res );
+                int64_t client_res = 0;
+                client_res_out = "Average for ";
+                if( client_num>0 )
+                    client_res = client_sum/client_num;    // получаем среднее
+                client_res_out += std::to_string(client_num) + " values = " + std::to_string(client_res)+"\r\n" +
+                        "Connection closed";
+                if( res )
+                    client_res_out += " by timeout\n";
+                else
+                    client_res_out += "by zero in input\n";
+                send( client_socket_fd, client_res_out.data(), client_res_out.length(), MSG_NOSIGNAL ); // выводим среднее в сокет клиенту
+
+                mlock( serv_res, sizeof(struct results) );  // блокируем общую память
+                serv_res->num_val += client_num;            // добавляем результаты текущего клиента
+                serv_res->sum_val += client_sum;
+                munlock( serv_res, sizeof(struct results) );    // разблокируем
 
                 time(&now);
                 tm_ptr = localtime(&now);
@@ -191,16 +183,20 @@ int server()
                 if( shutdown( client_socket_fd, SHUT_RDWR )==-1 )
                 {
                     fprintf( log_file, "[Server] Error closed client %d: %s\n", getpid(), strerror(errno));
-                    exit( 1 );
+                    fflush( log_file );
+                    exit( 2 );
                 }
                 close(client_socket_fd); //--естествено закрываем сокет
                 fprintf( log_file, "[Server] Client %d closed\n", getpid() );
                 fflush( log_file );
-//           cout<<"tut4 res="<<res<<endl;
-                exit( res ); //--гасим дочерний процесс
+                exit( 2 ); //--гасим дочерний процесс
             }
             else if( pid>0 )   // parent
             {
+                child_data new_child;
+                new_child.pid = pid;
+                new_child.fd = client_socket_fd;
+                childs.push_back( new_child ); // добавляем дочерний процесс в список
                 close(client_socket_fd);    // закрываем сокет в родителе, в дочке он остается открытым
                 fflush( log_file );
             }
@@ -216,16 +212,26 @@ int server()
 //            fprintf( log_file, "[Server] Accept failed fd=%d: %s\n", client_socket_fd, strerror(errno));
             usleep( 10000 );
         }
-//     cout<<"tut6 ret="<<ret<<endl;
+        if( ret==2 ) // получена команда завершения сервера
+        {
+            for( auto i=childs.begin(); i!=childs.end(); ++i )
+            {
+                if( child_pid == i->pid )
+                {
+                    fprintf( log_file, "[Server] Client %d out of server\n", child_pid );
+                    childs.erase( i );
+                    break;
+                }
+            }
+            if( childs.size() == 0 )
+                ret = 3;
+        }
         if( ret==3 ) // получена команда завершения сервера
         {
-            int64_t serv_sum_val;   // общая сумма полученных чисел
-            int64_t serv_num_val;    // общее количество полученных чисел
-            fprintf( log_file, "[Server] Shutdown server received\n" );
+            fprintf( log_file, "[Server] Server shutdown: no clients\n" );
             for( auto i: childs )
             {
-                serv_sum_val += i.sum_val;
-                serv_num_val += i.num_val;
+                fprintf( log_file, "[Server] i.pid=%d\n", i.pid );
                 shutdown( i.fd, SHUT_RDWR );
                 close( i.fd );
                 kill( i.pid, SIGTERM );
@@ -234,9 +240,9 @@ int server()
             if( fd_res )  //  файл открыт
             {
                 int64_t res = 0;
-                if( serv_num_val )
-                    res = serv_sum_val/serv_num_val;
-                if( fprintf( fd_res, "Average for %lld values = %lld\n", serv_num_val, res)<0 || // ошибка при записи в файл
+                if( serv_res->num_val )
+                    res = serv_res->sum_val/serv_res->num_val;
+                if( fprintf( fd_res, "Average for %lld values = %lld\n", serv_res->num_val, res)<0 || // ошибка при записи в файл
                         fclose( fd_res )!=0 )   // ошибка закрытия файла
                     fprintf( log_file, "Error writing result.txt \"%s\"\n", strerror(errno));
             }
@@ -244,6 +250,7 @@ int server()
                 fprintf( log_file, "Error open result.txt \"%s\"\n", strerror(errno));
             shutdown( master_socket, SHUT_RDWR );
             close( master_socket );
+            shm_unlink("as.shm");	// убиваем файл общей памяти
             fprintf( log_file, "[Server] Closed\n" );
             fflush( log_file );
             break;
@@ -294,28 +301,48 @@ int main( int argc, char** argv )
         exit( 1 );
     }
     perror( "Try to open avarage_server.log");
+
+    shm_unlink("as.shm");
+    shm_d = shm_open("as.shm", O_RDWR | O_CREAT, 0666);
+    if( shm_d==-1 )
+    {
+        perror( "Error shm_open" );
+        exit( 1 );
+    }
+    if( ftruncate(shm_d, sizeof(struct results)) == -1 )
+    {
+        perror( "Error ftruncate shared memory" );
+        exit( 1 );
+    }
+    serv_res = static_cast<struct results*>( mmap( 0, sizeof(struct results), PROT_READ | PROT_WRITE, MAP_SHARED, shm_d, 0 ));
+    if( serv_res==MAP_FAILED )
+    {
+        perror( "Error mmap shared memory" );
+        exit( 1 );
+    }
+
     fprintf( log_file, "\n=============== New session started =================\n" );
     fprintf( log_file, "current_dir=%s port=%s\n", current_dir.data(), port.data() );
     fflush( log_file );
 
-//    pid = fork();
-//    if( pid<0 )
-//    {
-//        perror( "fork");
-//        exit( 1 );
-//    }
-//    else if( pid>0 )  // parent
-//    {
-//        return 0;   // закрываем родительский процесс
-//    }
-//    else       // child
+    pid = fork();
+    if( pid<0 )
+    {
+        perror( "fork");
+        exit( 1 );
+    }
+    else if( pid>0 )  // parent
+    {
+        return 0;   // закрываем родительский процесс
+    }
+    else       // child
     {
         umask(0);   /* Изменяем файловую маску */
-//        if( setsid()<0 )    /* Создание нового SID для дочернего процесса */
-//        {
-//            perror( "setsid");
-//            exit( 1 );
-//        }
+        if( setsid()<0 )    /* Создание нового SID для дочернего процесса */
+        {
+            perror( "setsid");
+            exit( 1 );
+        }
 
         if( (chdir(current_dir.data())) < 0) /* Изменяем текущий рабочий каталог */
         {
@@ -324,11 +351,11 @@ int main( int argc, char** argv )
         }
         printf( "Server ready on port %s\n", port.data() );
     /* Закрываем стандартные файловые дескрипторы */
-//        close(STDIN_FILENO);
-//        close(STDOUT_FILENO);
-//        close(STDERR_FILENO);
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
         pid = server();
-//        return pid;
+        return pid;
     }
     return 0;
 }
