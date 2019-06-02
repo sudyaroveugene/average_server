@@ -294,13 +294,13 @@ int main( int argc, char** argv )
     }
 // открываем файл лога
 //    printf( "Try to open final.log");
-    log_file = fopen( "avarage_server.log", "a" );
+    log_file = fopen( "average_server.log", "a" );
     if( log_file==nullptr )
     {
-        perror( "Error open avarage_server.log");
+        perror( "Error open average_server.log");
         exit( 1 );
     }
-    perror( "Try to open avarage_server.log");
+    perror( "Try to open average_server.log");
 
     shm_unlink("as.shm");
     shm_d = shm_open("as.shm", O_RDWR | O_CREAT, 0666);
@@ -349,7 +349,6 @@ int main( int argc, char** argv )
             perror( "chdir" );
             exit( 1 );
         }
-        printf( "Server ready on port %s\n", port.data() );
     /* Закрываем стандартные файловые дескрипторы */
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
